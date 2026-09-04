@@ -2,15 +2,14 @@
 
 ## Diagram
 
-[React Dashboard]
-      |
-      | EventSource — one persistent SSE connection
-      |
-[Express Backend] ←—— stores trades in memory
-      |
-      | axios streaming GET /getTrades (background)
-      |
-[Mock BSE API] ——— streams batches with configurable delay
+```mermaid
+graph TD
+    A[React Dashboard] -->|EventSource - persistent SSE connection| B[Express Backend]
+    B -->|stores trades in memory| B
+    B -->|axios streaming GET /getTrades background| C[Mock BSE API]
+    C -->|streams batches with configurable delay| B
+    B -->|broadcasts trades via SSE| A
+```
 
 ## Why This Design
 
