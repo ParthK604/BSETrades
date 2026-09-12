@@ -1,100 +1,132 @@
-# BSE Trade Dashboard
+# TradeStream — Real-Time BSE Trade Analytics Platform
 
-Real-time trade data dashboard that streams live trades from a mock BSE Exchange API using **Server Sent Events (SSE)** — no polling, no page refresh, no cron jobs.
+A real-time trade data dashboard that streams live trades from a mock BSE Exchange API using **Server Sent Events (SSE)**, with **Redis caching** and full **Docker** containerization.
+
+No polling. No page refresh. No cron jobs.
 
 ---
 
 ## The Problem
 
-The BSE pull takes up to **15 minutes** to complete. But the network kills any HTTP connection held open longer than **30 seconds**.
+The BSE pull takes up to **15 minutes** to complete. The network kills any HTTP connection held open longer than **30 seconds**.
 
-A standard GET request fails — the client would have to wait 15 minutes for a response that never comes (connection dies at 30s).
+A standard GET request fails — the client waits 15 minutes for a response that never arrives (connection dies at 30s).
 
 ---
 
-## The Solution — Server Sent Events (SSE)
+## The Solution
 
-Instead of the client waiting for a response, the client opens **one persistent SSE connection** to the backend. The backend pulls from BSE independently in the background and **pushes** each batch of trades to the frontend as they arrive.
+Three architectural decisions solve this cleanly —
 
-```
-[React Dashboard]
-      |
-      | EventSource — one persistent SSE connection
-      |
-[Express Backend] ←—— stores trades in memory as they arrive
-      |
-      | axios streaming GET /getTrades (background, independent of client)
-      |
-[Mock BSE API] ——— streams 3000 trade records with configurable delay
-```
+**1. Server Sent Events (SSE)**
+Client opens one persistent connection to the backend. Backend pulls from BSE independently in the background and pushes each batch of trades to the frontend as they arrive. No timeout. No polling.
 
-### Why SSE over WebSockets?
-Data only flows **one way** — server to client. SSE is built for this exact use case. WebSockets are bidirectional and overkill here. SSE is simpler, natively supported by browsers via `EventSource`, and requires no extra libraries on the frontend.
+**2. Redis Caching**
+When a pull completes, all 3000 trades are cached in Redis with a 1 hour TTL. Any new client connecting after the pull gets data instantly from Redis — no re-pull needed.
 
-### Why not polling?
-The assignment explicitly rules it out — and rightly so. Polling every few seconds creates hundreds of unnecessary requests over a 15-minute pull. SSE uses a single connection for the entire duration.
-
-### Why not a cron job?
-Cron jobs run on a schedule, not on demand. The pull needs to be user-triggered and the dashboard needs to update instantly when data arrives — not on the next scheduled tick.
+**3. Docker Compose**
+All backend services — mock BSE API, Express backend, Redis — run with a single command. No manual setup.
 
 ---
 
 ## Architecture
 
 ```
-bse-trades/
-├── mock-bse/                        # Fake BSE Exchange API (port 4000)
-│   ├── index.js                     # GET /getTrades — streams batches with delay
-│   └── seedData.js                  # Generates 3000 fake trade records
-│
-├── backend/                         # Main Express server (port 3000)
-│   ├── index.js                     # App entry, CORS, routes
-│   ├── routes/
-│   │   ├── trades.js                # GET /api/trades/stream — SSE endpoint
-│   │   └── pull.js                  # POST /api/pull — triggers BSE pull
-│   └── services/
-│       └── bsePuller.js             # Pulls from BSE, stores trades, broadcasts via SSE
-│
-├── frontend/                        # React dashboard (port 5173)
-│   └── src/
-│       ├── App.jsx
-│       └── components/
-│           └── TradesDashboard.jsx  # EventSource connection, live table
-│
-├── .gitignore
-└── README.md
+[React Dashboard]
+      |
+      | EventSource — one persistent SSE connection
+      |
+[Express Backend] ←—— Redis cache (1hr TTL)
+      |
+      | axios streaming GET /getTrades (background)
+      |
+[Mock BSE API] ——— streams 3000 trades in batches
 ```
+
+### Why SSE over WebSockets?
+Data flows one way — server to client. SSE is purpose built for this. WebSockets are bidirectional and overkill here. EventSource is natively supported by all browsers with no extra libraries.
+
+### Why not polling?
+Polling every few seconds creates hundreds of unnecessary requests over a 15-minute pull. SSE uses one connection for the entire duration.
+
+### Why Redis?
+Without caching, every new client connecting after a pull would either see no data or trigger a full 15-minute re-pull. Redis serves previously pulled trades instantly to late-joining clients.
+
+### Why Docker Compose?
+Three services need to talk to each other — Redis, mock BSE API, and the backend. Docker Compose wires them together with correct networking and startup order automatically.
 
 ---
 
-## How It Works — Step by Step
+## Data Flow
 
-**1. Dashboard loads**
-React connects to `GET /api/trades/stream` via `EventSource`. If trades were already pulled, they appear immediately. Connection stays open.
+```
+DURING PULL
+User hits "Start BSE Pull"
+        ↓
+POST /api/pull → pull runs in background, returns immediately
+        ↓
+mock BSE streams 3000 trades in batches of 50
+        ↓
+Each batch broadcast via SSE to all connected clients
+        ↓
+Dashboard table updates live
+        ↓
+Pull complete → all trades saved to Redis (1hr TTL)
 
-**2. User clicks "Start BSE Pull"**
-React calls `POST /api/pull`. Backend triggers `pullFromBSE()` in the background and responds immediately — the HTTP request doesn't wait for the pull to finish.
-
-**3. Pull runs in background**
-`bsePuller.js` makes a streaming axios request to the mock BSE API. Trades arrive in batches of 50 with a configurable delay between each batch.
-
-**4. Trades broadcast in real time**
-Every batch that arrives from BSE is immediately broadcast to all connected SSE clients. The dashboard table updates live — no refresh, no polling.
-
-**5. Pull completes**
-A `{ pullComplete: true }` signal is sent via SSE. Dashboard status updates to "Pull Complete."
+NEW CLIENT AFTER PULL
+Client connects to SSE stream
+        ↓
+Backend checks Redis
+        ↓
+Cache HIT → sends all trades instantly
+Cache MISS → sends empty, waits for next pull
+```
 
 ---
 
 ## Tech Stack
 
-| Part | Technology |
+| Layer | Technology |
 |---|---|
-| Mock BSE API | Node.js, Express |
-| Backend | Node.js, Express, axios |
-| Real-time | Server Sent Events (SSE) |
 | Frontend | React, Vite |
-| Styling | Inline styles, dark theme |
+| Real-time | Server Sent Events (SSE) |
+| Backend | Node.js, Express |
+| Caching | Redis |
+| Mock API | Node.js, Express |
+| Containerization | Docker, Docker Compose |
+
+---
+
+## Project Structure
+
+```
+BSETrades/
+├── mock-BSE/
+│   ├── index.js           # GET /getTrades — streams batches with delay
+│   ├── seedData.js        # Generates 3000 fake trade records
+│   ├── Dockerfile
+│   └── package.json
+│
+├── backend/
+│   ├── index.js           # Express app entry, CORS
+│   ├── routes/
+│   │   ├── trades.js      # GET /api/trades/stream — SSE endpoint
+│   │   └── pull.js        # POST /api/pull — triggers BSE pull
+│   ├── services/
+│   │   └── bsePuller.js   # Pull logic, Redis cache, SSE broadcast
+│   ├── Dockerfile
+│   └── package.json
+│
+├── frontend/
+│   └── src/
+│       ├── App.jsx
+│       └── components/
+│           └── TradesDashboard.jsx
+│
+├── docker-compose.yml
+├── .gitignore
+└── README.md
+```
 
 ---
 
@@ -102,98 +134,105 @@ A `{ pullComplete: true }` signal is sent via SSE. Dashboard status updates to "
 
 ### Prerequisites
 - Node.js v18+
-- npm
+- Docker and Docker Compose
 
-### 1. Clone the repo
+### Option 1 — Docker (Recommended)
 
 ```bash
-git clone https://github.com/ParthK604/BSETrades
-cd bse-trades
+git clone <your-repo-url>
+cd BSETrades
+
+docker-compose up --build
 ```
 
-### 2. Install dependencies
+This starts Redis, mock BSE API, and backend together. Then run frontend separately —
 
 ```bash
-# Mock BSE API
-cd mock-bse
+cd frontend
 npm install
-
-# Backend
-cd ../backend
-npm install
-
-# Frontend
-cd ../frontend/my-app
-npm install
+npm run dev
 ```
 
-### 3. Run all three servers
+Open `http://localhost:5173`
 
-Open **three separate terminals** —
+### Option 2 — Run Locally Without Docker
 
-**Terminal 1 — Mock BSE API**
+**Terminal 1 — Redis**
 ```bash
-cd mock-bse
+# Make sure Redis is installed and running
+redis-server
+```
+
+**Terminal 2 — Mock BSE API**
+```bash
+cd mock-BSE
+npm install
 node index.js
 # Running on http://localhost:4000
 ```
 
-**Terminal 2 — Backend**
+**Terminal 3 — Backend**
 ```bash
 cd backend
+npm install
 node index.js
 # Running on http://localhost:3000
 ```
 
-**Terminal 3 — Frontend**
+**Terminal 4 — Frontend**
 ```bash
-cd frontend/my-app
+cd frontend
+npm install
 npm run dev
 # Running on http://localhost:5173
 ```
 
-### 4. Open the dashboard
+---
 
-Go to `http://localhost:5173` in your browser.
+## API Endpoints
 
-Click **"Start BSE Pull"** and watch trades stream in live.
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/getTrades` | Mock BSE — streams seeded trades in batches |
+| POST | `/api/pull` | Triggers background BSE pull |
+| GET | `/api/trades/stream` | SSE endpoint — pushes trades to connected clients |
 
 ---
 
 ## Configurable Delay
 
-The mock BSE API delay between batches is configurable via environment variable.
+Control pull speed via environment variable —
 
 ```bash
-# Fast — for testing (500ms between batches)
+# Fast — for testing (default)
 DELAY_MS=500 node index.js
 
-# Slow — simulates real 15 min pull
+# Slow — simulates real 15 min BSE pull
 DELAY_MS=30000 node index.js
 ```
-
-Default is 500ms for easy demonstration.
-
----
-
-## Key API Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/getTrades` | Mock BSE — returns seeded trades in batches |
-| POST | `/api/pull` | Triggers background BSE pull |
-| GET | `/api/trades/stream` | SSE endpoint — push trades to connected clients |
 
 ---
 
 ## Dashboard Features
 
-- Live trade table with real-time updates
+- Live trade table — updates without any page refresh
 - Stats bar — total trades, unique symbols, total volume, pull status
-- Connection status indicator
+- Connection status indicator — shows SSE connection state
+- Redis cache indicator — shows when data is served from cache
 - Auto-scroll to latest trades
-- Symbol colour coding
-- Instant load — shows existing trades on connect even if pull is mid-way
+- Symbol colour coding per stock
+
+---
+
+## Key Design Decisions
+
+| Decision | Choice | Reason |
+|---|---|---|
+| Real-time protocol | SSE over WebSockets | One-way data flow, simpler, native browser support |
+| Caching | Redis | Instant data for late-joining clients, configurable TTL |
+| Pull trigger | Manual POST | User controlled, pull independent of client connection |
+| Containerization | Docker Compose | Single command startup, correct service networking |
+| Data storage | In-memory + Redis | No DB needed — trades are session data |
 
 ---
 

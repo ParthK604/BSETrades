@@ -1,27 +1,35 @@
 const axios = require('axios')
+const { createClient } = require('redis')
 
-// All connected SSE clients stored here
+// Redis client
+const redisClient = createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+})
+
+redisClient.on('error', (err) => console.error('Redis error:', err))
+
+async function connectRedis() {
+  await redisClient.connect()
+  console.log('Connected to Redis')
+}
+
+connectRedis()
+
+// SSE clients
 let clients = []
-
-// All trades pulled so far stored here
 let pulledTrades = []
-
-// Track if pull is currently running
 let isPulling = false
 
-// Register a new SSE client
 function addClient(res) {
   clients.push(res)
-  console.log(`Client connected. Total clients: ${clients.length}`)
+  console.log(`Client connected. Total: ${clients.length}`)
 }
 
-// Remove client when they disconnect
 function removeClient(res) {
   clients = clients.filter(c => c !== res)
-  console.log(`Client disconnected. Total clients: ${clients.length}`)
+  console.log(`Client disconnected. Total: ${clients.length}`)
 }
 
-// Get all trades pulled so far
 function getExistingTrades() {
   return pulledTrades
 }
@@ -30,14 +38,18 @@ function isPullRunning() {
   return isPulling
 }
 
-// Broadcast new trades to all connected clients
+// Get cached trades from Redis
+async function getCachedTrades() {
+  const cached = await redisClient.get('bse:trades')
+  return cached ? JSON.parse(cached) : null
+}
+
 function broadcast(trades) {
   clients.forEach(client => {
     client.write(`data: ${JSON.stringify(trades)}\n\n`)
   })
 }
 
-// Main pull function — calls mock BSE API
 async function pullFromBSE() {
   if (isPulling) {
     console.log('Pull already in progress')
@@ -45,41 +57,44 @@ async function pullFromBSE() {
   }
 
   isPulling = true
-  pulledTrades = [] // reset on new pull
+  pulledTrades = []
   console.log('Starting BSE pull...')
 
   try {
     const response = await axios({
       method: 'get',
-      url: 'http://localhost:4000/getTrades',
-      responseType: 'stream'  // stream the response
+      url: process.env.BSE_URL 
+        ? `${process.env.BSE_URL}/getTrades` 
+        : 'http://localhost:4000/getTrades',
+      responseType: 'stream'
     })
 
     let buffer = ''
 
     response.data.on('data', (chunk) => {
       buffer += chunk.toString()
-
-      // Each chunk is a JSON array — try to parse
       try {
         const trades = JSON.parse(buffer)
-        buffer = '' // clear buffer on success
-
-        // Store trades
+        buffer = ''
         pulledTrades = [...pulledTrades, ...trades]
-
-        // Broadcast to all connected clients
         broadcast(trades)
-
-        console.log(`Pulled and broadcasted ${trades.length} trades. Total: ${pulledTrades.length}`)
+        console.log(`Pulled ${trades.length}. Total: ${pulledTrades.length}`)
       } catch (e) {
-        // Chunk not complete yet — keep buffering
+        // keep buffering
       }
     })
 
-    response.data.on('end', () => {
+    response.data.on('end', async () => {
       console.log('BSE pull complete.')
       isPulling = false
+
+      // Save to Redis with 1 hour TTL
+      await redisClient.set(
+        'bse:trades',
+        JSON.stringify(pulledTrades),
+        { EX: 3600 }
+      )
+      console.log('Trades cached in Redis')
 
       // Broadcast pull complete signal
       clients.forEach(client => {
@@ -103,5 +118,6 @@ module.exports = {
   removeClient,
   getExistingTrades,
   isPullRunning,
-  pullFromBSE
+  pullFromBSE,
+  getCachedTrades
 }
